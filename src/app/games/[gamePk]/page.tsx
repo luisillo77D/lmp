@@ -125,13 +125,25 @@ export default async function GameDetailPage({ params }: GameDetailPageProps) {
               key={m.market}
               className="rounded-2xl border border-stone-200 bg-white p-6 space-y-2 shadow-2xs"
             >
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <span className="text-xs font-semibold uppercase tracking-wider text-stone-500">
                   {m.market}
                 </span>
-                <span className="rounded-full bg-emerald-50 border border-emerald-200 px-2.5 py-0.5 text-xs font-semibold text-emerald-800">
-                  Confianza {m.confidence}
-                </span>
+                <div className="flex items-center gap-1.5">
+                  {m.result === "won" && (
+                    <span className="rounded-full bg-emerald-50 border border-emerald-300 px-2.5 py-0.5 text-xs font-semibold text-emerald-800">
+                      ✓ Acertado
+                    </span>
+                  )}
+                  {m.result === "lost" && (
+                    <span className="rounded-full bg-stone-100 border border-stone-300 px-2.5 py-0.5 text-xs font-semibold text-stone-500">
+                      ✕ Fallado
+                    </span>
+                  )}
+                  <span className="rounded-full bg-amber-50/80 border border-amber-200 px-2.5 py-0.5 text-xs font-semibold text-amber-900">
+                    Confianza {m.confidence}
+                  </span>
+                </div>
               </div>
               <div className="flex items-baseline justify-between pt-1">
                 <span className="font-serif text-2xl font-bold text-stone-900">{m.pick}</span>

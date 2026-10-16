@@ -79,6 +79,7 @@ export interface MarketRecommendation {
   line: string;
   confidence: "Alta" | "Media" | "Moderada";
   rationale: string;
+  result: "won" | "lost" | "pending";
 }
 
 export interface HybridGameAnalysis {
@@ -290,6 +291,14 @@ export function evaluateGameMatchup(matchup: GameMatchupInput): HybridGameAnalys
   const totalScorecardPoints = factors.reduce((acc, f) => acc + f.score, 0);
 
   // --- MARKET RECOMMENDATIONS (Ganador, Hándicap ±1.5, Totales) ---
+  const isFinalWithScores =
+    matchup.statusCode === "F" &&
+    typeof matchup.awayScore === "number" &&
+    typeof matchup.homeScore === "number" &&
+    matchup.awayScore !== matchup.homeScore;
+
+  const actualAwayScore = matchup.awayScore ?? 0;
+  const actualHomeScore = matchup.homeScore ?? 0;
 
   // 1. Ganador (Moneyline)
   const favoredIsHome = projectedMargin > 0 || (projectedMargin === 0 && totalScorecardPoints >= 0);
@@ -301,12 +310,19 @@ export function evaluateGameMatchup(matchup: GameMatchupInput): HybridGameAnalys
   const mlConfidence: "Alta" | "Media" | "Moderada" =
     absMargin >= 1.1 && absPoints >= 3 ? "Alta" : absMargin >= 0.5 || absPoints >= 2 ? "Media" : "Moderada";
 
+  const mlResult: "won" | "lost" | "pending" = isFinalWithScores
+    ? (favoredIsHome ? actualHomeScore > actualAwayScore : actualAwayScore > actualHomeScore)
+      ? "won"
+      : "lost"
+    : "pending";
+
   const moneylineRec: MarketRecommendation = {
     market: "Ganador",
     pick: `${favoredTeam.shortName} a Ganar`,
     line: `Proy: ${favoredTeam.abbreviation} ${(favoredIsHome ? projectedHomeRuns : projectedAwayRuns).toFixed(1)} - ${(favoredIsHome ? projectedAwayRuns : projectedHomeRuns).toFixed(1)}`,
     confidence: mlConfidence,
     rationale: `${favoredTeam.shortName} proyecta ventaja de +${absMargin.toFixed(1)} carreras y +${absPoints} puntos en el semáforo de factores.`,
+    result: mlResult,
   };
 
   // 2. Hándicap (Runline ±1.5)
@@ -319,6 +335,20 @@ export function evaluateGameMatchup(matchup: GameMatchupInput): HybridGameAnalys
     ? "Alta"
     : "Media";
 
+  const actualFavoredMargin = favoredIsHome
+    ? actualHomeScore - actualAwayScore
+    : actualAwayScore - actualHomeScore;
+
+  const rlResult: "won" | "lost" | "pending" = isFinalWithScores
+    ? coverMinus15
+      ? actualFavoredMargin >= 2
+        ? "won"
+        : "lost"
+      : actualFavoredMargin <= 1
+      ? "won"
+      : "lost"
+    : "pending";
+
   const runlineRec: MarketRecommendation = coverMinus15
     ? {
         market: "Hándicap",
@@ -326,6 +356,7 @@ export function evaluateGameMatchup(matchup: GameMatchupInput): HybridGameAnalys
         line: "Hándicap -1.5 C",
         confidence: runlineConfidence,
         rationale: `El margen proyectado de ${absMargin.toFixed(1)} carreras respalda que ${favoredTeam.shortName} cubra la línea de -1.5.`,
+        result: rlResult,
       }
     : {
         market: "Hándicap",
@@ -333,6 +364,7 @@ export function evaluateGameMatchup(matchup: GameMatchupInput): HybridGameAnalys
         line: "Hándicap +1.5 C",
         confidence: runlineConfidence,
         rationale: `Juego cerrado (margen estimado de ${absMargin.toFixed(1)} carreras) que da alto valor a ${underdogTeam.shortName} +1.5 carreras.`,
+        result: rlResult,
       };
 
   // 3. Totales (Altas / Bajas respecto a línea base de 8.5)
@@ -342,6 +374,17 @@ export function evaluateGameMatchup(matchup: GameMatchupInput): HybridGameAnalys
   const totalsConfidence: "Alta" | "Media" | "Moderada" =
     absTotalDelta >= 1.0 ? "Alta" : absTotalDelta >= 0.5 ? "Media" : "Moderada";
 
+  const actualTotalRuns = actualAwayScore + actualHomeScore;
+  const totalsResult: "won" | "lost" | "pending" = isFinalWithScores
+    ? isOver
+      ? actualTotalRuns > LEAGUE_BOOK_TOTAL_LINE
+        ? "won"
+        : "lost"
+      : actualTotalRuns < LEAGUE_BOOK_TOTAL_LINE
+      ? "won"
+      : "lost"
+    : "pending";
+
   const totalsRec: MarketRecommendation = {
     market: "Totales",
     pick: `${isOver ? "ALTAS" : "BAJAS"} ${LEAGUE_BOOK_TOTAL_LINE}`,
@@ -350,6 +393,7 @@ export function evaluateGameMatchup(matchup: GameMatchupInput): HybridGameAnalys
     rationale: isOver
       ? `La proyección combinada de ${projectedTotalRuns.toFixed(1)} carreras supera la línea de ${LEAGUE_BOOK_TOTAL_LINE} por el ritmo ofensivo y pitcheo.`
       : `El duelo de pitcheo proyecta ${projectedTotalRuns.toFixed(1)} carreras combinadas, favoreciendo las Bajas de ${LEAGUE_BOOK_TOTAL_LINE}.`,
+    result: totalsResult,
   };
 
   return {
@@ -367,3 +411,59 @@ export function evaluateGameMatchup(matchup: GameMatchupInput): HybridGameAnalys
     factors,
   };
 }
+
+/**
+ * Grades a locked pre-game market pick against the final score once a game finishes.
+ */
+export function gradeMarketPick(params: {
+  market: "Ganador" | "Hándicap" | "Totales";
+  pick: string;
+  awayTeamShortName: string;
+  homeTeamShortName: string;
+  awayScore: number | null | undefined;
+  homeScore: number | null | undefined;
+  statusCode: string;
+}): "won" | "lost" | "pending" {
+  const { market, pick, awayTeamShortName, homeTeamShortName, awayScore, homeScore, statusCode } =
+    params;
+
+  if (
+    statusCode !== "F" ||
+    typeof awayScore !== "number" ||
+    typeof homeScore !== "number" ||
+    awayScore === homeScore
+  ) {
+    return "pending";
+  }
+
+  const pickedHome = pick.startsWith(homeTeamShortName);
+  const pickedAway = pick.startsWith(awayTeamShortName);
+
+  if (market === "Ganador") {
+    if (pickedHome) return homeScore > awayScore ? "won" : "lost";
+    if (pickedAway) return awayScore > homeScore ? "won" : "lost";
+    return "pending";
+  }
+
+  if (market === "Hándicap") {
+    const isMinus15 = pick.includes("-1.5");
+    if (pickedHome) {
+      const margin = homeScore - awayScore;
+      return isMinus15 ? (margin >= 2 ? "won" : "lost") : margin >= -1 ? "won" : "lost";
+    }
+    if (pickedAway) {
+      const margin = awayScore - homeScore;
+      return isMinus15 ? (margin >= 2 ? "won" : "lost") : margin >= -1 ? "won" : "lost";
+    }
+    return "pending";
+  }
+
+  if (market === "Totales") {
+    const total = awayScore + homeScore;
+    if (pick.startsWith("ALTAS")) return total > LEAGUE_BOOK_TOTAL_LINE ? "won" : "lost";
+    if (pick.startsWith("BAJAS")) return total < LEAGUE_BOOK_TOTAL_LINE ? "won" : "lost";
+  }
+
+  return "pending";
+}
+

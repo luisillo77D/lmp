@@ -8,6 +8,7 @@ import {
   fetchTeamRosterWithStats,
   LMP_DEFAULT_SEASON,
 } from "@/lib/mlb-api";
+import { getSlateWithRecommendations } from "@/lib/data-service";
 import { getSupabaseAdminClient } from "@/lib/supabase";
 
 export const maxDuration = 60;
@@ -333,6 +334,34 @@ async function handleSync(req: NextRequest) {
       }
     }
 
+    // 5. Best-effort persistence of system picks into system_picks table (if created)
+    let systemPicksCount = 0;
+    try {
+      const { allWindowGames } = await getSlateWithRecommendations();
+      const pickRows = allWindowGames.flatMap((g) =>
+        Object.values(g.analysis.markets).map((m) => ({
+          game_pk: g.gamePk,
+          official_date: g.officialDate,
+          market: m.market,
+          pick: m.pick,
+          line: m.line,
+          confidence: m.confidence,
+          result: m.result,
+          updated_at: new Date().toISOString(),
+        }))
+      );
+      if (pickRows.length > 0) {
+        const { error: picksErr } = await supabase
+          .from("system_picks")
+          .upsert(pickRows, { onConflict: "game_pk,market" });
+        if (!picksErr) {
+          systemPicksCount = pickRows.length;
+        }
+      }
+    } catch {
+      // Non-blocking if system_picks table is not yet migrated
+    }
+
     return NextResponse.json({
       ok: true,
       syncedAt: new Date().toISOString(),
@@ -341,6 +370,7 @@ async function handleSync(req: NextRequest) {
         players: playerRows.length,
         games: gameRows.length,
         playerGameStats: gameLogCount,
+        systemPicks: systemPicksCount,
       },
     });
   } catch (err) {

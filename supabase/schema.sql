@@ -155,3 +155,25 @@ CREATE POLICY "Allow public read access on games"
 
 CREATE POLICY "Allow public read access on player_game_stats"
   ON public.player_game_stats FOR SELECT USING (true);
+
+-- 5. System Picks Table (Tracks historical model recommendations & W-L results)
+CREATE TABLE IF NOT EXISTS public.system_picks (
+  id BIGSERIAL PRIMARY KEY,
+  game_pk BIGINT NOT NULL REFERENCES public.games(game_pk) ON DELETE CASCADE,
+  official_date DATE NOT NULL,
+  market TEXT NOT NULL CHECK (market IN ('Ganador', 'Hándicap', 'Totales')),
+  pick TEXT NOT NULL,
+  line TEXT NOT NULL,
+  confidence TEXT NOT NULL,
+  result TEXT NOT NULL DEFAULT 'pending' CHECK (result IN ('won', 'lost', 'pending')),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (game_pk, market)
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_picks_date ON public.system_picks(official_date DESC);
+
+ALTER TABLE public.system_picks ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Allow public read access on system_picks"
+  ON public.system_picks FOR SELECT USING (true);
+

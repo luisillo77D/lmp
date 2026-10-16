@@ -12,6 +12,7 @@ import {
 import {
   evaluateGameMatchup,
   GameMatchupInput,
+  gradeMarketPick,
   HybridGameAnalysis,
   PitcherMetrics,
   TeamMetrics,
@@ -20,6 +21,21 @@ import { getSupabasePublicClient, isSupabaseConfigured } from "./supabase";
 
 export interface EnrichedGameMatchup extends GameMatchupInput {
   analysis: HybridGameAnalysis;
+}
+
+export interface SystemRecordBucket {
+  wins: number;
+  losses: number;
+  pct: number;
+}
+
+export interface SystemRecordSummary {
+  overall: SystemRecordBucket;
+  moneyline: SystemRecordBucket;
+  runline: SystemRecordBucket;
+  totals: SystemRecordBucket;
+  highConfidence: SystemRecordBucket;
+  gamesEvaluated: number;
 }
 
 export interface PlayerRecord {
@@ -183,17 +199,26 @@ export async function getSlateWithRecommendations(targetDate?: string): Promise<
   activeDate: string;
   availableDates: string[];
   games: EnrichedGameMatchup[];
+  allWindowGames: EnrichedGameMatchup[];
   source: "supabase" | "mlb-live";
+  systemRecord: SystemRecordSummary;
 }> {
   const { teams, source } = await getTeamsWithStandings();
   const teamMap = new Map(teams.map((t) => [t.id, t]));
 
-  const requestedDate = targetDate || getDefaultLmpDate();
+  const todayDate = getDefaultLmpDate();
+  const requestedDate = targetDate || todayDate;
 
-  // Fetch a window around the requested date so the user can easily navigate dates
+  // Fetch window covers both the requested date navigation AND the completed games up to today
   const baseDateObj = new Date(`${requestedDate}T12:00:00Z`);
-  const startWindow = new Date(baseDateObj.getTime() - 4 * 86400000).toISOString().slice(0, 10);
-  const endWindow = new Date(baseDateObj.getTime() + 5 * 86400000).toISOString().slice(0, 10);
+  const todayDateObj = new Date(`${todayDate}T12:00:00Z`);
+  const navStart = new Date(baseDateObj.getTime() - 4 * 86400000).toISOString().slice(0, 10);
+  const navEnd = new Date(baseDateObj.getTime() + 5 * 86400000).toISOString().slice(0, 10);
+  const recordStart = new Date(todayDateObj.getTime() - 14 * 86400000).toISOString().slice(0, 10);
+  const recordEnd = new Date(todayDateObj.getTime() + 3 * 86400000).toISOString().slice(0, 10);
+
+  const startWindow = navStart < recordStart ? navStart : recordStart;
+  const endWindow = navEnd > recordEnd ? navEnd : recordEnd;
 
   const scheduleGames = await fetchLmpSchedule({
     startDate: startWindow,
@@ -202,7 +227,9 @@ export async function getSlateWithRecommendations(targetDate?: string): Promise<
 
   const dateSet = new Set<string>();
   for (const g of scheduleGames) {
-    dateSet.add(g.officialDate);
+    if (g.officialDate >= navStart && g.officialDate <= navEnd) {
+      dateSet.add(g.officialDate);
+    }
   }
   const availableDates = Array.from(dateSet).sort();
 
@@ -266,10 +293,104 @@ export async function getSlateWithRecommendations(targetDate?: string): Promise<
     }
   }
 
-  const dayGames = scheduleGames.filter((g) => g.officialDate === activeDate);
+  // Load locked picks from system_picks if the table exists in Supabase
+  const lockedPicksByGame = new Map<
+    number,
+    Map<string, { pick: string; line: string; confidence: "Alta" | "Media" | "Moderada"; result: "won" | "lost" | "pending" }>
+  >();
+  if (supabase && isSupabaseConfigured()) {
+    try {
+      const { data: savedPicks, error: picksError } = await supabase
+        .from("system_picks")
+        .select("game_pk,market,pick,line,confidence,result");
+      if (!picksError && savedPicks) {
+        for (const row of savedPicks) {
+          const gpk = Number(row.game_pk);
+          const gameMap = lockedPicksByGame.get(gpk) ?? new Map();
+          gameMap.set(String(row.market), {
+            pick: String(row.pick),
+            line: String(row.line),
+            confidence: (row.confidence as "Alta" | "Media" | "Moderada") ?? "Media",
+            result: (row.result as "won" | "lost" | "pending") ?? "pending",
+          });
+          lockedPicksByGame.set(gpk, gameMap);
+        }
+      }
+    } catch {
+      // Ignore if system_picks table is not yet created
+    }
+  }
 
-  const enrichedGames: EnrichedGameMatchup[] = dayGames.map((g) => {
-    const awayTeam =
+  /**
+   * Builds a pre-game snapshot of a team's metrics strictly from games completed BEFORE `beforeDate`
+   * so historical game grading never leaks the final score of the game being evaluated.
+   */
+  const getPreGameTeamSnapshot = (baseTeam: TeamMetrics, beforeDate: string): TeamMetrics => {
+    const priorGames = completedGames.filter(
+      (cg) =>
+        cg.officialDate < beforeDate &&
+        (cg.teams.away.team.id === baseTeam.id || cg.teams.home.team.id === baseTeam.id)
+    );
+
+    let wins = 0;
+    let losses = 0;
+    let homeWins = 0;
+    let homeLosses = 0;
+    let awayWins = 0;
+    let awayLosses = 0;
+    let runsScored = 0;
+    let runsAllowed = 0;
+    const recentScores: number[] = [];
+
+    for (const pg of priorGames) {
+      const isHome = pg.teams.home.team.id === baseTeam.id;
+      const myScore = (isHome ? pg.teams.home.score : pg.teams.away.score) ?? 0;
+      const oppScore = (isHome ? pg.teams.away.score : pg.teams.home.score) ?? 0;
+
+      runsScored += myScore;
+      runsAllowed += oppScore;
+      recentScores.push(myScore);
+
+      if (myScore > oppScore) {
+        wins += 1;
+        if (isHome) homeWins += 1;
+        else awayWins += 1;
+      } else if (oppScore > myScore) {
+        losses += 1;
+        if (isHome) homeLosses += 1;
+        else awayLosses += 1;
+      }
+    }
+
+    const gp = wins + losses;
+    const priorEra = gp > 0 ? Number(((runsAllowed / gp) * 0.92).toFixed(2)) : 3.9;
+    const lastFive = recentScores.slice(-5);
+
+    return {
+      ...baseTeam,
+      wins,
+      losses,
+      winningPercentage: gp > 0 ? Number((wins / gp).toFixed(3)) : 0.5,
+      runsScored,
+      runsAllowed,
+      runDifferential: runsScored - runsAllowed,
+      homeWins,
+      homeLosses,
+      awayWins,
+      awayLosses,
+      lastTenWins: wins,
+      lastTenLosses: losses,
+      teamEra: priorEra,
+      bullpenEra: priorEra,
+      recentRunsPerGame:
+        lastFive.length > 0
+          ? lastFive.reduce((s, v) => s + v, 0) / lastFive.length
+          : undefined,
+    };
+  };
+
+  const enrichScheduleGame = (g: (typeof scheduleGames)[number]): EnrichedGameMatchup => {
+    const rawAwayTeam =
       teamMap.get(g.teams.away.team.id) ?? {
         id: g.teams.away.team.id,
         name: g.teams.away.team.name,
@@ -296,7 +417,7 @@ export async function getSlateWithRecommendations(targetDate?: string): Promise<
         bullpenEra: 3.95,
       };
 
-    const homeTeam =
+    const rawHomeTeam =
       teamMap.get(g.teams.home.team.id) ?? {
         id: g.teams.home.team.id,
         name: g.teams.home.team.name,
@@ -323,31 +444,42 @@ export async function getSlateWithRecommendations(targetDate?: string): Promise<
         bullpenEra: 3.95,
       };
 
+    const isCompletedGame = g.status.statusCode === "F";
+    const awayTeam = isCompletedGame
+      ? getPreGameTeamSnapshot(rawAwayTeam, g.officialDate)
+      : rawAwayTeam;
+    const homeTeam = isCompletedGame
+      ? getPreGameTeamSnapshot(rawHomeTeam, g.officialDate)
+      : rawHomeTeam;
+
     const awayProbableRaw = g.teams.away.probablePitcher;
     const homeProbableRaw = g.teams.home.probablePitcher;
 
     const dbAwayPitcher = awayProbableRaw ? pitcherMap.get(awayProbableRaw.id) : undefined;
     const dbHomePitcher = homeProbableRaw ? pitcherMap.get(homeProbableRaw.id) : undefined;
 
+    // For completed games in week 1, use pre-start baseline for starters so post-game ERA doesn't leak
     const probableAwayPitcher: PitcherMetrics | null = awayProbableRaw
       ? {
           id: awayProbableRaw.id,
           fullName: dbAwayPitcher?.fullName ?? awayProbableRaw.fullName,
           pitchHand: dbAwayPitcher?.pitchHand ?? "R",
-          gamesStarted: dbAwayPitcher?.gamesStarted || 1,
-          wins: dbAwayPitcher?.wins ?? awayProbableRaw.wins ?? 0,
-          losses: dbAwayPitcher?.losses ?? awayProbableRaw.losses ?? 0,
-          inningsPitched:
-            dbAwayPitcher && dbAwayPitcher.inningsPitched > 0
-              ? dbAwayPitcher.inningsPitched
-              : awayProbableRaw.era !== undefined
-              ? 5.0
-              : 0,
-          era:
-            dbAwayPitcher && dbAwayPitcher.inningsPitched > 0
-              ? dbAwayPitcher.era
-              : awayProbableRaw.era ?? (awayTeam.teamEra || 3.85),
-          whip: dbAwayPitcher?.whip || 1.25,
+          gamesStarted: isCompletedGame ? 0 : dbAwayPitcher?.gamesStarted || 1,
+          wins: isCompletedGame ? 0 : dbAwayPitcher?.wins ?? awayProbableRaw.wins ?? 0,
+          losses: isCompletedGame ? 0 : dbAwayPitcher?.losses ?? awayProbableRaw.losses ?? 0,
+          inningsPitched: isCompletedGame
+            ? 0
+            : dbAwayPitcher && dbAwayPitcher.inningsPitched > 0
+            ? dbAwayPitcher.inningsPitched
+            : awayProbableRaw.era !== undefined
+            ? 5.0
+            : 0,
+          era: isCompletedGame
+            ? awayTeam.teamEra || 3.85
+            : dbAwayPitcher && dbAwayPitcher.inningsPitched > 0
+            ? dbAwayPitcher.era
+            : awayProbableRaw.era ?? (awayTeam.teamEra || 3.85),
+          whip: isCompletedGame ? 1.25 : dbAwayPitcher?.whip || 1.25,
           strikeOuts: dbAwayPitcher?.strikeOuts ?? 4,
           walks: dbAwayPitcher?.walks ?? 2,
         }
@@ -358,20 +490,22 @@ export async function getSlateWithRecommendations(targetDate?: string): Promise<
           id: homeProbableRaw.id,
           fullName: dbHomePitcher?.fullName ?? homeProbableRaw.fullName,
           pitchHand: dbHomePitcher?.pitchHand ?? "R",
-          gamesStarted: dbHomePitcher?.gamesStarted || 1,
-          wins: dbHomePitcher?.wins ?? homeProbableRaw.wins ?? 0,
-          losses: dbHomePitcher?.losses ?? homeProbableRaw.losses ?? 0,
-          inningsPitched:
-            dbHomePitcher && dbHomePitcher.inningsPitched > 0
-              ? dbHomePitcher.inningsPitched
-              : homeProbableRaw.era !== undefined
-              ? 5.0
-              : 0,
-          era:
-            dbHomePitcher && dbHomePitcher.inningsPitched > 0
-              ? dbHomePitcher.era
-              : homeProbableRaw.era ?? (homeTeam.teamEra || 3.75),
-          whip: dbHomePitcher?.whip || 1.22,
+          gamesStarted: isCompletedGame ? 0 : dbHomePitcher?.gamesStarted || 1,
+          wins: isCompletedGame ? 0 : dbHomePitcher?.wins ?? homeProbableRaw.wins ?? 0,
+          losses: isCompletedGame ? 0 : dbHomePitcher?.losses ?? homeProbableRaw.losses ?? 0,
+          inningsPitched: isCompletedGame
+            ? 0
+            : dbHomePitcher && dbHomePitcher.inningsPitched > 0
+            ? dbHomePitcher.inningsPitched
+            : homeProbableRaw.era !== undefined
+            ? 5.0
+            : 0,
+          era: isCompletedGame
+            ? homeTeam.teamEra || 3.75
+            : dbHomePitcher && dbHomePitcher.inningsPitched > 0
+            ? dbHomePitcher.era
+            : homeProbableRaw.era ?? (homeTeam.teamEra || 3.75),
+          whip: isCompletedGame ? 1.22 : dbHomePitcher?.whip || 1.22,
           strikeOuts: dbHomePitcher?.strikeOuts ?? 5,
           walks: dbHomePitcher?.walks ?? 2,
         }
@@ -384,8 +518,8 @@ export async function getSlateWithRecommendations(targetDate?: string): Promise<
       statusCode: g.status.statusCode,
       detailedState: g.status.detailedState,
       venueName: g.venue?.name ?? homeTeam.venueName,
-      awayTeam,
-      homeTeam,
+      awayTeam: rawAwayTeam,
+      homeTeam: rawHomeTeam,
       awayScore: g.teams.away.score ?? g.linescore?.teams?.away?.runs ?? null,
       homeScore: g.teams.home.score ?? g.linescore?.teams?.home?.runs ?? null,
       awayHits: g.linescore?.teams?.away?.hits ?? null,
@@ -396,17 +530,111 @@ export async function getSlateWithRecommendations(targetDate?: string): Promise<
       probableHomePitcher,
     };
 
+    const analysis = evaluateGameMatchup({
+      ...matchupInput,
+      awayTeam,
+      homeTeam,
+    });
+
+    // Overlay locked picks from Supabase system_picks if present for this game
+    const lockedForGame = lockedPicksByGame.get(g.gamePk);
+    if (lockedForGame) {
+      for (const key of ["moneyline", "runline", "totals"] as const) {
+        const m = analysis.markets[key];
+        const locked = lockedForGame.get(m.market);
+        if (locked) {
+          m.pick = locked.pick;
+          m.line = locked.line;
+          m.confidence = locked.confidence;
+          m.result =
+            locked.result !== "pending"
+              ? locked.result
+              : gradeMarketPick({
+                  market: m.market,
+                  pick: locked.pick,
+                  awayTeamShortName: rawAwayTeam.shortName,
+                  homeTeamShortName: rawHomeTeam.shortName,
+                  awayScore: matchupInput.awayScore,
+                  homeScore: matchupInput.homeScore,
+                  statusCode: matchupInput.statusCode,
+                });
+        }
+      }
+    }
+
     return {
       ...matchupInput,
-      analysis: evaluateGameMatchup(matchupInput),
+      analysis,
     };
-  });
+  };
+
+  const allEnrichedGames = scheduleGames.map(enrichScheduleGame);
+  const enrichedGames = allEnrichedGames.filter((g) => g.officialDate === activeDate);
+
+  // Tally system recommendation accuracy across all completed games in the window
+  const makeBucket = (wins: number, losses: number): SystemRecordBucket => {
+    const total = wins + losses;
+    return {
+      wins,
+      losses,
+      pct: total > 0 ? Number(((wins / total) * 100).toFixed(1)) : 0,
+    };
+  };
+
+  let mlWins = 0;
+  let mlLosses = 0;
+  let rlWins = 0;
+  let rlLosses = 0;
+  let totWins = 0;
+  let totLosses = 0;
+  let highWins = 0;
+  let highLosses = 0;
+  let gamesEvaluated = 0;
+
+  for (const g of allEnrichedGames) {
+    if (g.statusCode !== "F" || g.awayScore === null || g.homeScore === null) {
+      continue;
+    }
+    gamesEvaluated += 1;
+
+    for (const m of Object.values(g.analysis.markets)) {
+      if (m.result === "pending") continue;
+      const isWin = m.result === "won";
+
+      if (m.market === "Ganador") {
+        if (isWin) mlWins += 1;
+        else mlLosses += 1;
+      } else if (m.market === "Hándicap") {
+        if (isWin) rlWins += 1;
+        else rlLosses += 1;
+      } else if (m.market === "Totales") {
+        if (isWin) totWins += 1;
+        else totLosses += 1;
+      }
+
+      if (m.confidence === "Alta") {
+        if (isWin) highWins += 1;
+        else highLosses += 1;
+      }
+    }
+  }
+
+  const systemRecord: SystemRecordSummary = {
+    overall: makeBucket(mlWins + rlWins + totWins, mlLosses + rlLosses + totLosses),
+    moneyline: makeBucket(mlWins, mlLosses),
+    runline: makeBucket(rlWins, rlLosses),
+    totals: makeBucket(totWins, totLosses),
+    highConfidence: makeBucket(highWins, highLosses),
+    gamesEvaluated,
+  };
 
   return {
     activeDate,
     availableDates,
     games: enrichedGames,
+    allWindowGames: allEnrichedGames,
     source,
+    systemRecord,
   };
 }
 

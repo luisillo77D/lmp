@@ -23,11 +23,34 @@ function ConfidencePill({ level }: { level: "Alta" | "Media" | "Moderada" }) {
   );
 }
 
+function MarketStatusBadge({
+  level,
+  result,
+}: {
+  level: "Alta" | "Media" | "Moderada";
+  result: "won" | "lost" | "pending";
+}) {
+  if (result === "won") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-emerald-300 bg-emerald-50 px-2.5 py-0.5 text-[11px] font-semibold text-emerald-800">
+        ✓ Acertado
+      </span>
+    );
+  }
+  if (result === "lost") {
+    return (
+      <span className="inline-flex items-center gap-1 rounded-full border border-stone-300 bg-stone-100 px-2.5 py-0.5 text-[11px] font-semibold text-stone-500">
+        ✕ Fallado
+      </span>
+    );
+  }
+  return <ConfidencePill level={level} />;
+}
+
 export default async function HomePage({ searchParams }: HomePageProps) {
   const params = await searchParams;
-  const { activeDate, availableDates, games } = await getSlateWithRecommendations(
-    params.date
-  );
+  const { activeDate, availableDates, games, systemRecord } =
+    await getSlateWithRecommendations(params.date);
 
   // Extract featured picks of the day
   const featuredPicks: Array<{
@@ -38,6 +61,7 @@ export default async function HomePage({ searchParams }: HomePageProps) {
     line: string;
     confidence: "Alta" | "Media" | "Moderada";
     rationale: string;
+    result: "won" | "lost" | "pending";
   }> = [];
 
   for (const g of games) {
@@ -56,6 +80,7 @@ export default async function HomePage({ searchParams }: HomePageProps) {
           line: m.line,
           confidence: m.confidence,
           rationale: m.rationale,
+          result: m.result,
         });
       }
     }
@@ -66,44 +91,96 @@ export default async function HomePage({ searchParams }: HomePageProps) {
   );
 
   return (
-    <div className="space-y-10">
+    <div className="space-y-8">
       {/* Editorial Header & Date Strip */}
-      <section className="flex flex-col justify-between gap-6 border-b border-stone-200/90 pb-6 md:flex-row md:items-end">
-        <div className="space-y-1.5">
-          <p className="text-xs font-semibold uppercase tracking-widest text-amber-800">
-            Guía Diaria de Juegos y Proyecciones
-          </p>
-          <h1 className="font-serif text-3xl font-bold tracking-tight text-stone-900 sm:text-4xl">
-            Cartelera y Análisis de la Jornada
-          </h1>
-          <p className="text-sm text-stone-600 max-w-2xl">
-            Proyección de carreras combinando abridores probables, descanso del bullpen y ritmo ofensivo de los últimos 5 juegos.
-          </p>
+      <section className="space-y-5 border-b border-stone-200/90 pb-6">
+        <div className="flex flex-col justify-between gap-6 md:flex-row md:items-end">
+          <div className="space-y-1.5">
+            <p className="text-xs font-semibold uppercase tracking-widest text-amber-800">
+              Guía Diaria de Juegos y Proyecciones
+            </p>
+            <h1 className="font-serif text-3xl font-bold tracking-tight text-stone-900 sm:text-4xl">
+              Cartelera y Análisis de la Jornada
+            </h1>
+            <p className="text-sm text-stone-600 max-w-2xl">
+              Proyección de carreras combinando abridores probables, descanso del bullpen y ritmo ofensivo de los últimos 5 juegos.
+            </p>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5 rounded-2xl border border-stone-200/90 bg-[#F3EDE2]/80 p-1.5">
+            <span className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-stone-600">
+              <Calendar className="h-3.5 w-3.5 text-amber-800" />
+              Fecha
+            </span>
+            {availableDates.map((d) => {
+              const isSelected = d === activeDate;
+              const shortLabel = d.slice(5); // MM-DD
+              return (
+                <Link
+                  key={d}
+                  href={`/?date=${d}`}
+                  className={`rounded-xl px-3 py-1.5 text-xs font-semibold transition ${
+                    isSelected
+                      ? "bg-amber-800 text-amber-50 shadow-xs"
+                      : "text-stone-600 hover:bg-white/70 hover:text-stone-900"
+                  }`}
+                >
+                  {shortLabel}
+                </Link>
+              );
+            })}
+          </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-1.5 rounded-2xl border border-stone-200/90 bg-[#F3EDE2]/80 p-1.5">
-          <span className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-stone-600">
-            <Calendar className="h-3.5 w-3.5 text-amber-800" />
-            Fecha
-          </span>
-          {availableDates.map((d) => {
-            const isSelected = d === activeDate;
-            const shortLabel = d.slice(5); // MM-DD
-            return (
-              <Link
-                key={d}
-                href={`/?date=${d}`}
-                className={`rounded-xl px-3 py-1.5 text-xs font-semibold transition ${
-                  isSelected
-                    ? "bg-amber-800 text-amber-50 shadow-xs"
-                    : "text-stone-600 hover:bg-white/70 hover:text-stone-900"
-                }`}
-              >
-                {shortLabel}
-              </Link>
-            );
-          })}
-        </div>
+        {/* Compact System Recommendation Record Strip */}
+        {systemRecord.gamesEvaluated > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-stone-200/90 bg-[#F7F3EB] px-4 py-2.5 text-xs text-stone-700">
+            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
+              <span className="inline-flex items-center gap-1.5 font-semibold text-stone-900">
+                <span className="h-2 w-2 rounded-full bg-emerald-700" />
+                Récord del Sistema:{" "}
+                <span className="font-mono text-emerald-900">
+                  {systemRecord.overall.wins}-{systemRecord.overall.losses} (
+                  {systemRecord.overall.pct}%)
+                </span>
+              </span>
+              <span className="text-stone-300">·</span>
+              <span>
+                Ganador{" "}
+                <strong className="font-mono font-semibold text-stone-900">
+                  {systemRecord.moneyline.wins}-{systemRecord.moneyline.losses}
+                </strong>
+              </span>
+              <span className="text-stone-300">·</span>
+              <span>
+                Hándicap{" "}
+                <strong className="font-mono font-semibold text-stone-900">
+                  {systemRecord.runline.wins}-{systemRecord.runline.losses}
+                </strong>
+              </span>
+              <span className="text-stone-300">·</span>
+              <span>
+                Totales{" "}
+                <strong className="font-mono font-semibold text-stone-900">
+                  {systemRecord.totals.wins}-{systemRecord.totals.losses}
+                </strong>
+              </span>
+            </div>
+
+            <div className="flex items-center gap-2 text-[11px] text-stone-500">
+              {systemRecord.highConfidence.wins + systemRecord.highConfidence.losses > 0 && (
+                <span className="rounded-md border border-emerald-200 bg-emerald-50/80 px-2 py-0.5 font-medium text-emerald-800">
+                  Confianza Alta:{" "}
+                  <strong className="font-mono">
+                    {systemRecord.highConfidence.wins}-{systemRecord.highConfidence.losses} (
+                    {systemRecord.highConfidence.pct}%)
+                  </strong>
+                </span>
+              )}
+              <span>{systemRecord.gamesEvaluated} juegos finalizados</span>
+            </div>
+          </div>
+        )}
       </section>
 
       {/* Featured Notebook Picks */}
@@ -130,7 +207,7 @@ export default async function HomePage({ searchParams }: HomePageProps) {
                     <span className="text-xs font-medium text-stone-500">
                       {item.market}
                     </span>
-                    <ConfidencePill level={item.confidence} />
+                    <MarketStatusBadge level={item.confidence} result={item.result} />
                   </div>
                   <p className="mt-2 font-serif text-xl font-bold text-stone-900 group-hover:text-amber-800 transition">
                     {item.pick}
@@ -311,7 +388,7 @@ function MatchupScorecard({ game }: { game: EnrichedGameMatchup }) {
             >
               <div className="flex items-center justify-between gap-1">
                 <span className="text-xs font-medium text-stone-500">{m.market}</span>
-                <ConfidencePill level={m.confidence} />
+                <MarketStatusBadge level={m.confidence} result={m.result} />
               </div>
               <p className="mt-2 font-serif text-base font-bold text-stone-900">{m.pick}</p>
               <p className="mt-0.5 font-mono text-xs text-amber-800">{m.line}</p>
